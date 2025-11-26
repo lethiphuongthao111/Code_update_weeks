@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Visualize ψ (heading) & d (cross-track) **trực tiếp từ ảnh RAW** (chưa có model).
+Ý tưởng: tạo "mask mặt đường" heuristic ở nửa dưới ảnh → scanline → tâm làn phải → ψ,d.
+
+Cách chạy:
+python3 viz_psi_d_from_raw.py --img path/to/raw.jpg --lanes 2 --show
+# Nếu ảnh cao 480, mặc định y* = 380, dy = 20, ROI-top = 190 là ổn.
+
+Tham số:
+  --lanes {1,2}   : 1 làn (đường 1 chiều) hay 2 làn (2 chiều). Bạn đang 2 làn.
+  --y-star, --dy  : vị trí hàng đo d (pixel) & nửa bề cao dải quét.
+  --roi-top       : giới hạn vùng xử lý phía dưới ảnh (mặc định 190 cho 480p).
+  --save          : tên file đầu ra (mặc định vis_result.jpg).
+  --show          : bật hiển thị cửa sổ OpenCV.
+"""
+
+import argparse, math
+import numpy as np
+import cv2
+
+# ---------- Heuristic segmentation từ ảnh RAW ----------
+def autoseg_from_raw(img_bgr, roi_top=190):
+    H, W = img_bgr.shape[:2]
+    roi = img_bgr.copy()
+    if roi_top > 0:
+        roi[:roi_top, :] = 0  # chỉ giữ nửa dưới ảnh
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    Hc, Sc, Vc = cv2.split(hsv)
+
+    # Sàn bê tông: bão hoà thấp, độ sáng trung-bao
+    mask_gray   = ((Sc < 70) & (Vc > 40)).astype(np.uint8)*255
+    # Vạch trắng: rất sáng, bão hoà thấp
+    mask_white  = ((Vc > 160) & (Sc < 60)).astype(np.uint8)*255
+    # Vạch vàng: H ~ [15..40], S cao, V tương đối cao
+    mask_yellow = (((Hc >= 15) & (Hc <= 40)) & (Sc > 80) & (Vc > 60)).astype(np.uint8)*255
+
+    # Gộp & làm sạch
+    mask = cv2.bitwise_or(mask_gray, mask_white)
+    mask = cv2.bitwise_or(mask, mask_yellow)
+    mask = cv2.medianBlur(mask, 5)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7,7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # Giữ component lớn nhất (tránh dính tường/vật thể)
+    nb, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if nb > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        idx = 1 + np.argmax(areas)
+        clean = np.zeros_like(mask)
+        clean[labels == idx] = 255
+        mask = clean
+
+    # Erode nhẹ chống loé đèn
+    mask = cv2.erode(mask, np.ones((3,3), np.uint8), iterations=1)
+    return mask
+
+# ---------- Tính ψ & d từ mask “mặt đường” ----------
+def fit_centerline_from_mask(mask, lanes=2, y_star=380, dy=20, min_row_pixels=5):
+    H, W = mask.shape[:2]
+    ys_band = np.arange(max(0, y_star-dy), min(H, y_star+dy+1))
+    samples = []
+    for y in ys_band:
+        row = mask[y, :]
+        xs = np.where(row > 0)[0]
+        if xs.size < min_row_pixels:
+            continue
+        xL, xR = int(xs.min()), int(xs.max())
+        W_y = xR - xL
+        if W_y <= 0:
+            continue
+        if lanes == 1:
+            xC = 0.5*(xL + xR)     # tâm đường
+        else:
+            xC = xR - 0.25*W_y     # tâm làn phải (2 làn)
+        samples.append((y, xL, xR, xC))
+
+    if len(samples) < 8:
+        return 0.0, 0.0, dict(ok=False, reason="not_enough_samples",
+                              band=(int(max(0,y_star-dy)), int(min(H-1,y_star+dy))),
+                              y_star=int(y_star))
+
+    ys  = np.array([s[0] for s in samples], dtype=np.float32)
+    xCs = np.array([s[3] for s in samples], dtype=np.float32)
+    A   = np.vstack([ys, np.ones_like(ys)]).T
+    a, b = np.linalg.lstsq(A, xCs, rcond=None)[0]  # x ≈ a*y + b
+
+    # ψ: góc giữa tiếp tuyến & trục dọc ảnh (quy ước ψ>0 khi quay về phải)
+    psi_rad = -math.atan2(float(a), 1.0)
+
+    # d (pixel): lệch ngang tại y* so với tâm ảnh
+    x_c = float(a*y_star + b)
+    d_px = float(x_c - (W/2))
+
+    info = dict(ok=True, a=float(a), b=float(b), y_star=int(y_star),
+                x_c=float(x_c), W=int(W),
+                band=(int(max(0, y_star-dy)), int(min(H-1, y_star+dy))))
+    return psi_rad, d_px, info
+
+# ---------- Vẽ overlay ----------
+def draw_vis(image_bgr, mask_bin, psi_rad, d_px, info):
+    img = image_bgr.copy()
+    H, W = img.shape[:2]
+
+    # overlay mask
+    color = cv2.applyColorMap((mask_bin>0).astype(np.uint8)*255, cv2.COLORMAP_OCEAN)
+    img = cv2.addWeighted(img, 1.0, color, 0.25, 0)
+
+    # dải quét
+    y1, y2 = info.get("band", (0, H-1))
+    cv2.rectangle(img, (0, y1), (W-1, y2), (0,255,0), 2)
+
+    # đường giữa ảnh (tham chiếu d)
+    cx = W//2
+    cv2.line(img, (cx, 0), (cx, H-1), (255,255,255), 1)
+
+    # kẻ gạch dải quét
+    for y in (y1, y2, info.get("y_star", (y1+y2)//2)):
+        for x in range(0, W, 20):
+            cv2.line(img, (x, y), (min(W-1, x+10), y), (0,165,255), 1)
+
+    # vẽ centerline & mũi tên
+    if info.get("ok", False):
+        a, b = info["a"], info["b"]
+        x_top = int(a*0 + b)
+        x_bot = int(a*(H-1) + b)
+        cv2.line(img, (x_top, 0), (x_bot, H-1), (255,255,0), 2)  # cyan
+
+        y_star = int(info["y_star"])
+        x_c    = int(info["x_c"])
+        cv2.circle(img, (x_c, y_star), 5, (0,255,255), -1)       # dot tại y*
+
+        # mũi tên d (magenta)
+        cv2.arrowedLine(img, (cx, y_star), (x_c, y_star), (255,0,255), 2, tipLength=0.15)
+
+        # mũi tên ψ (vàng) theo tiếp tuyến (dx,dy) ~ (a,1)
+        scale = 80
+        dx, dy = a*scale, 1.0*scale
+        p0 = (x_c, y_star)
+        p1 = (int(x_c + dx), int(y_star + dy))
+        cv2.arrowedLine(img, p0, p1, (0,255,255), 2, tipLength=0.2)
+
+    psi_deg = np.degrees(psi_rad)
+    txt = f"psi={psi_deg:+.1f} deg | d={d_px:+.1f} px"
+    cv2.putText(img, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,0), 3, cv2.LINE_AA)
+    cv2.putText(img, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2, cv2.LINE_AA)
+    return img
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--img", type=str, required=True)
+    ap.add_argument("--lanes", type=int, default=2, choices=[1,2])
+    ap.add_argument("--y-star", type=int, default=380)
+    ap.add_argument("--dy", type=int, default=20)
+    ap.add_argument("--roi-top", type=int, default=190)
+    ap.add_argument("--save", type=str, default="vis_result.jpg")
+    ap.add_argument("--show", action="store_true")
+    args = ap.parse_args()
+
+    img = cv2.imread(args.img, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read image: {args.img}")
+
+    mask = autoseg_from_raw(img, roi_top=args.roi_top)
+    psi, d_px, info = fit_centerline_from_mask(mask, args.lanes, args.y_star, args.dy)
+    vis = draw_vis(img, mask, psi, d_px, info)
+    cv2.imwrite(args.save, vis)
+    print(f"[ok] {args.save}  ψ={np.degrees(psi):+.1f} deg  d={d_px:+.1f} px")
+
+    if args.show:
+        cv2.imshow("raw", img)
+        cv2.imshow("mask", mask)
+        cv2.imshow("vis", vis)
+        cv2.waitKey(0)
+
+if __name__ == "__main__":
+    main()
