@@ -1,0 +1,667 @@
+import pygame
+import sys
+import math
+import random
+
+# ================== CẤU HÌNH ==================
+WIDTH, HEIGHT = 1400, 1150
+FPS = 60
+
+GRID_SIZE = 40
+GRID_COLOR = (225, 225, 225)
+
+CURSOR_RADIUS = 8
+CURSOR_COLOR = (255, 0, 0)
+
+LINE_COLOR = (255, 215, 0)      # vàng
+LINE_WIDTH = 5
+
+# TEMPLATE (BÀI MẪU)
+TEMPLATE_COLOR = (175, 175, 175)   # xám nhạt, đủ thấy
+START_COLOR = (0, 180, 0)          # xanh lá
+TEMPLATE_WIDTH = 4                 # nét mẫu to hơn chút
+START_RADIUS = 10                  # điểm bắt đầu to hơn
+TEMPLATE_SCALE = 160               # kích thước mẫu (tăng từ ~120)
+
+AXIS_RX = 2                      # Right Stick X
+AXIS_RY = 3                      # Right Stick Y
+DEADZONE = 0.12
+
+# TỐC ĐỘ 2 TRẠNG THÁI
+SPEED_IDLE = 5                # không vẽ (nhanh)
+SPEED_DRAW = 1.4                 # đang vẽ (chậm, mượt)
+
+SENSITIVITY = 1.0                # hệ số khuếch đại (1.0 = bình thường, >1 = nhạy hơn)
+DIAG_SENS_GAIN = 0.8             # boost nhạy khi đi xéo (0.5-1.0)
+
+# ACCELERATION SMOOTHING (giảm rung, nét tròn đều hơn)
+ACCEL_PX_S2_IDLE = 2800.0        # gia tốc tối đa (pixel/s²) khi KHÔNG vẽ
+ACCEL_PX_S2_DRAW = 800.0         # gia tốc tối đa khi ĐANG vẽ (mượt hơn)
+
+INVERT_X = True                  # bạn muốn ngược lại thì True
+INVERT_Y = True                  # bạn muốn ngược lại thì True
+
+DRAW_BTN = 4                     # giữ để vẽ
+UNDO_BTN = 5                     # nhấn 1 lần để xóa stroke gần nhất
+REDO_BTN = 7                     # nhấn 1 lần để khôi phục stroke vừa xóa
+
+MIN_POINT_DIST = 2.0             # giảm răng cưa + đỡ quá nhiều điểm
+
+# ================== INIT ==================
+pygame.init()
+pygame.joystick.init()
+
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Joystick Paint (B4:Draw | B5:Undo | B7:Redo)")
+clock = pygame.time.Clock()
+
+# ================== JOYSTICK ==================
+if pygame.joystick.get_count() == 0:
+    print("❌ Không tìm thấy tay cầm")
+    sys.exit()
+
+js = pygame.joystick.Joystick(0)
+js.init()
+
+print("🎮 Tay cầm:", js.get_name())
+print("Axes:", js.get_numaxes(), "| Buttons:", js.get_numbuttons(), "| Hats:", js.get_numhats())
+
+# ================== HÀM PHỤ ==================
+def draw_grid(surface):
+    for gx in range(0, WIDTH, GRID_SIZE):
+        pygame.draw.line(surface, GRID_COLOR, (gx, 0), (gx, HEIGHT))
+    for gy in range(0, HEIGHT, GRID_SIZE):
+        pygame.draw.line(surface, GRID_COLOR, (0, gy), (WIDTH, gy))
+
+def apply_deadzone(v: float) -> float:
+    return 0.0 if abs(v) < DEADZONE else v
+
+def normalize_if_needed(rx: float, ry: float) -> tuple[float, float]:
+    # giữ cảm giác đều khi đi chéo
+    mag = math.hypot(rx, ry)
+    if mag > 1.0:
+        rx /= mag
+        ry /= mag
+    return rx, ry
+
+def add_point_to_stroke(stroke: list[tuple[int, int]], px: int, py: int):
+    if not stroke:
+        stroke.append((px, py))
+        return
+    lx, ly = stroke[-1]
+    if math.hypot(px - lx, py - ly) >= MIN_POINT_DIST:
+        stroke.append((px, py))
+
+# ================== HÀM PHỤ CHO TEMPLATE ==================
+def poly(cx, cy, r, n):
+    """Tạo đa giác đều n cạnh"""
+    pts = []
+    for i in range(n + 1):
+        a = 2 * math.pi * i / n - math.pi / 2  # bắt đầu từ trên
+        pts.append((int(cx + r * math.cos(a)), int(cy + r * math.sin(a))))
+    return pts
+
+def arc(cx, cy, rx, ry, a0, a1, pts=40):
+    """Tạo cung tròn/ellipse"""
+    out = []
+    for i in range(pts + 1):
+        a = a0 + (a1 - a0) * i / pts
+        out.append((int(cx + rx * math.cos(a)), int(cy + ry * math.sin(a))))
+    return out
+
+# ================== TEMPLATE HÌNH HỌC ==================
+def tpl_circle(cx, cy, s):
+    p = poly(cx, cy, s, 80)
+    return {"name":"circle","strokes":[p],
+            "start_points":[p[i] for i in (0,20,40,60)]}
+
+def tpl_ellipse(cx, cy, s):
+    p = arc(cx, cy, s*1.2, s*0.7, 0, 2*math.pi, 80)
+    return {"name":"ellipse","strokes":[p],
+            "start_points":[p[i] for i in (0,20,40,60)]}
+
+def tpl_square(cx, cy, s):
+    a=(cx-s,cy-s); b=(cx+s,cy-s); c=(cx+s,cy+s); d=(cx-s,cy+s)
+    return {"name":"square","strokes":[[a,b,c,d,a]],
+            "start_points":[a,b,c,d]}
+
+def tpl_rectangle(cx, cy, s):
+    w, h = int(s*1.3), int(s*0.8)
+    a=(cx-w,cy-h); b=(cx+w,cy-h); c=(cx+w,cy+h); d=(cx-w,cy+h)
+    return {"name":"rectangle","strokes":[[a,b,c,d,a]],
+            "start_points":[a,b,c,d]}
+
+def tpl_triangle(cx, cy, s):
+    p=poly(cx,cy,s,3)
+    return {"name":"triangle","strokes":[p],
+            "start_points":p[:-1]}
+
+def tpl_pentagon(cx, cy, s):
+    p=poly(cx,cy,s,5)
+    return {"name":"pentagon","strokes":[p],
+            "start_points":p[:-1]}
+
+def tpl_hexagon(cx, cy, s):
+    p=poly(cx,cy,s,6)
+    return {"name":"hexagon","strokes":[p],
+            "start_points":p[:-1]}
+
+def tpl_star(cx, cy, s):
+    pts=[]
+    for i in range(10):
+        r=s if i%2==0 else s*0.45
+        a=i*math.pi/5 - math.pi/2
+        pts.append((int(cx+r*math.cos(a)),int(cy+r*math.sin(a))))
+    pts.append(pts[0])
+    return {"name":"star","strokes":[pts],
+            "start_points":pts[:-1:2]}
+
+def tpl_plus(cx, cy, s):
+    return {"name":"plus",
+        "strokes":[[(cx-s,cy),(cx+s,cy)],[(cx,cy-s),(cx,cy+s)]],
+        "start_points":[(cx-s,cy),(cx+s,cy),(cx,cy-s),(cx,cy+s)]}
+
+def tpl_cross(cx, cy, s):
+    return {"name":"cross",
+        "strokes":[[(cx-s,cy-s),(cx+s,cy+s)],[(cx+s,cy-s),(cx-s,cy+s)]],
+        "start_points":[(cx-s,cy-s),(cx+s,cy-s),(cx+s,cy+s),(cx-s,cy+s)]}
+
+# ================== TEMPLATE CHỮ CÁI (A-Z) ==================
+def tpl_A(cx, cy, s):
+    return {"name":"A",
+        "strokes":[[(cx-s,cy+s),(cx,cy-s)],[(cx,cy-s),(cx+s,cy+s)],
+                   [(cx-int(0.5*s),cy),(cx+int(0.5*s),cy)]],
+        "start_points":[(cx-s,cy+s),(cx,cy-s),(cx+s,cy+s)]}
+
+def tpl_B(cx, cy, s):
+    up=arc(cx-s,cy-int(0.5*s),s,0.5*s,-math.pi/2,math.pi/2,20)
+    lo=arc(cx-s,cy+int(0.5*s),s,0.5*s,-math.pi/2,math.pi/2,20)
+    return {"name":"B",
+        "strokes":[[(cx-s,cy-s),(cx-s,cy+s)],up,lo],
+        "start_points":[(cx-s,cy-s),(cx-s,cy),(cx-s,cy+s)]}
+
+def tpl_C(cx, cy, s):
+    p=arc(cx,cy,s,s,math.pi/4,7*math.pi/4,50)
+    return {"name":"C","strokes":[p],
+            "start_points":[p[0],p[len(p)//2],p[-1]]}
+
+def tpl_D(cx, cy, s):
+    p=arc(cx-s,cy,s,s,-math.pi/2,math.pi/2,40)
+    return {"name":"D",
+        "strokes":[[(cx-s,cy-s),(cx-s,cy+s)],p],
+        "start_points":[(cx-s,cy-s),(cx-s,cy+s)]}
+
+def tpl_E(cx, cy, s):
+    return {"name":"E",
+        "strokes":[[(cx-s,cy-s),(cx-s,cy+s)],[(cx-s,cy-s),(cx+s,cy-s)],
+                   [(cx-s,cy),(cx+int(0.7*s),cy)],[(cx-s,cy+s),(cx+s,cy+s)]],
+        "start_points":[(cx-s,cy-s),(cx-s,cy),(cx-s,cy+s)]}
+
+def tpl_F(cx, cy, s):
+    return {"name":"F",
+        "strokes":[[(cx-s,cy-s),(cx-s,cy+s)],[(cx-s,cy-s),(cx+s,cy-s)],
+                   [(cx-s,cy),(cx+int(0.7*s),cy)]],
+        "start_points":[(cx-s,cy-s),(cx-s,cy),(cx-s,cy+s)]}
+
+def tpl_G(cx, cy, s):
+    p=arc(cx,cy,s,s,math.pi/3,7*math.pi/4,50)
+    return {"name":"G",
+        "strokes":[p,[(cx,cy),(cx+s,cy)]],
+        "start_points":[p[0],p[len(p)//2],(cx,cy)]}
+
+def tpl_H(cx, cy, s):
+    return {"name":"H",
+        "strokes":[[(cx-s,cy-s),(cx-s,cy+s)],[(cx+s,cy-s),(cx+s,cy+s)],
+                   [(cx-s,cy),(cx+s,cy)]],
+        "start_points":[(cx-s,cy-s),(cx+s,cy-s),(cx-s,cy)]}
+
+def tpl_I(cx, cy, s):
+    return {"name":"I",
+        "strokes":[[(cx,cy-s),(cx,cy+s)],[(cx-int(0.5*s),cy-s),(cx+int(0.5*s),cy-s)],
+                   [(cx-int(0.5*s),cy+s),(cx+int(0.5*s),cy+s)]],
+        "start_points":[(cx,cy-s),(cx,cy+s)]}
+
+def tpl_J(cx, cy, s):
+    p=arc(cx-int(0.5*s),cy+int(0.5*s),int(0.5*s),int(0.5*s),0,math.pi,25)
+    return {"name":"J",
+        "strokes":[[(cx+s,cy-s),(cx+s,cy+int(0.5*s))],p],
+        "start_points":[(cx+s,cy-s),(cx+s,cy)]}
+
+def tpl_K(cx, cy, s):
+    return {"name":"K",
+        "strokes":[[(cx-s,cy-s),(cx-s,cy+s)],[(cx+s,cy-s),(cx-s,cy)],
+                   [(cx-s,cy),(cx+s,cy+s)]],
+        "start_points":[(cx-s,cy-s),(cx+s,cy-s),(cx-s,cy)]}
+
+def tpl_L(cx, cy, s):
+    return {"name":"L",
+        "strokes":[[(cx-s,cy-s),(cx-s,cy+s)],[(cx-s,cy+s),(cx+s,cy+s)]],
+        "start_points":[(cx-s,cy-s),(cx-s,cy+s),(cx+s,cy+s)]}
+
+def tpl_M(cx, cy, s):
+    return {"name":"M",
+        "strokes":[[(cx-s,cy+s),(cx-s,cy-s)],[(cx-s,cy-s),(cx,cy)],
+                   [(cx,cy),(cx+s,cy-s)],[(cx+s,cy-s),(cx+s,cy+s)]],
+        "start_points":[(cx-s,cy+s),(cx-s,cy-s),(cx,cy),(cx+s,cy-s)]}
+
+def tpl_N(cx, cy, s):
+    return {"name":"N",
+        "strokes":[[(cx-s,cy+s),(cx-s,cy-s)],[(cx-s,cy-s),(cx+s,cy+s)],
+                   [(cx+s,cy+s),(cx+s,cy-s)]],
+        "start_points":[(cx-s,cy+s),(cx-s,cy-s),(cx+s,cy+s)]}
+
+def tpl_O(cx, cy, s):
+    p=arc(cx,cy,s,s,0,2*math.pi,60)
+    return {"name":"O","strokes":[p],
+            "start_points":[p[i] for i in (0,15,30,45)]}
+
+def tpl_P(cx, cy, s):
+    p=arc(cx-s,cy-int(0.5*s),s,0.5*s,-math.pi/2,math.pi/2,25)
+    return {"name":"P",
+        "strokes":[[(cx-s,cy+s),(cx-s,cy-s)],p],
+        "start_points":[(cx-s,cy+s),(cx-s,cy-s)]}
+
+def tpl_Q(cx, cy, s):
+    p=arc(cx,cy,s,s,0,2*math.pi,60)
+    return {"name":"Q",
+        "strokes":[p,[(cx+int(0.4*s),cy+int(0.4*s)),(cx+s,cy+s)]],
+        "start_points":[p[0],p[15],(cx+int(0.4*s),cy+int(0.4*s))]}
+
+def tpl_R(cx, cy, s):
+    p=arc(cx-s,cy-int(0.5*s),s,0.5*s,-math.pi/2,math.pi/2,25)
+    return {"name":"R",
+        "strokes":[[(cx-s,cy+s),(cx-s,cy-s)],p,[(cx-s,cy),(cx+s,cy+s)]],
+        "start_points":[(cx-s,cy+s),(cx-s,cy-s),(cx-s,cy)]}
+
+def tpl_S(cx, cy, s):
+    up=arc(cx,cy-int(0.5*s),int(0.6*s),int(0.5*s),math.pi/2,5*math.pi/2,25)
+    lo=arc(cx,cy+int(0.5*s),int(0.6*s),int(0.5*s),-math.pi/2,3*math.pi/2,25)
+    return {"name":"S","strokes":[up,lo],
+            "start_points":[up[0],up[-1]]}
+
+def tpl_T(cx, cy, s):
+    return {"name":"T",
+        "strokes":[[(cx-s,cy-s),(cx+s,cy-s)],[(cx,cy-s),(cx,cy+s)]],
+        "start_points":[(cx-s,cy-s),(cx+s,cy-s),(cx,cy-s)]}
+
+def tpl_U(cx, cy, s):
+    p=arc(cx,cy+int(0.5*s),s,int(0.5*s),math.pi,0,30)
+    return {"name":"U",
+        "strokes":[[(cx-s,cy-s),(cx-s,cy+int(0.5*s))],p,
+                   [(cx+s,cy+int(0.5*s)),(cx+s,cy-s)]],
+        "start_points":[(cx-s,cy-s),(cx+s,cy-s)]}
+
+def tpl_V(cx, cy, s):
+    return {"name":"V",
+        "strokes":[[(cx-s,cy-s),(cx,cy+s)],[(cx,cy+s),(cx+s,cy-s)]],
+        "start_points":[(cx-s,cy-s),(cx+s,cy-s),(cx,cy+s)]}
+
+def tpl_W(cx, cy, s):
+    return {"name":"W",
+        "strokes":[[(cx-s,cy-s),(cx-int(0.5*s),cy+s)],
+                   [(cx-int(0.5*s),cy+s),(cx,cy)],
+                   [(cx,cy),(cx+int(0.5*s),cy+s)],
+                   [(cx+int(0.5*s),cy+s),(cx+s,cy-s)]],
+        "start_points":[(cx-s,cy-s),(cx-int(0.5*s),cy+s),(cx,cy),(cx+int(0.5*s),cy+s)]}
+
+def tpl_X(cx, cy, s):
+    return {"name":"X",
+        "strokes":[[(cx-s,cy-s),(cx+s,cy+s)],[(cx+s,cy-s),(cx-s,cy+s)]],
+        "start_points":[(cx-s,cy-s),(cx+s,cy-s),(cx+s,cy+s),(cx-s,cy+s)]}
+
+def tpl_Y(cx, cy, s=None):
+    if s is None:
+        s = TEMPLATE_SCALE
+    return {"name":"Y",
+        "strokes":[[(cx-s,cy-s),(cx,cy)],[(cx+s,cy-s),(cx,cy)],
+                   [(cx,cy),(cx,cy+s)]],
+        "start_points":[(cx-s,cy-s),(cx+s,cy-s),(cx,cy)]}
+
+def tpl_Z(cx, cy, s):
+    return {"name":"Z",
+        "strokes":[[(cx-s,cy-s),(cx+s,cy-s),(cx-s,cy+s),(cx+s,cy+s)]],
+        "start_points":[(cx-s,cy-s),(cx+s,cy-s)]}
+
+# ================== TEMPLATE SỐ (0-9) ==================
+def tpl_0(cx, cy, s):
+    p=arc(cx,cy,s*0.8,s,0,2*math.pi,60)
+    return {"name":"0","strokes":[p],
+            "start_points":[p[i] for i in (0,15,30,45)]}
+
+def tpl_1(cx, cy, s):
+    return {"name":"1",
+        "strokes":[[(cx,cy-s),(cx,cy+s)],[(cx-int(0.3*s),cy-int(0.6*s)),(cx,cy-s)]],
+        "start_points":[(cx,cy-s),(cx,cy+s)]}
+
+def tpl_2(cx, cy, s):
+    up=arc(cx,cy-int(0.3*s),int(0.7*s),int(0.7*s),-math.pi,0,30)
+    return {"name":"2",
+        "strokes":[up,[(up[-1][0],up[-1][1]),(cx-s,cy+s)],
+                   [(cx-s,cy+s),(cx+s,cy+s)]],
+        "start_points":[up[0],up[-1]]}
+
+def tpl_3(cx, cy, s):
+    up=arc(cx,cy-int(0.5*s),int(0.7*s),int(0.5*s),-math.pi/2,math.pi,25)
+    lo=arc(cx,cy+int(0.5*s),int(0.7*s),int(0.5*s),math.pi,5*math.pi/2,25)
+    return {"name":"3","strokes":[up,lo],
+            "start_points":[up[0],up[-1]]}
+
+def tpl_4(cx, cy, s):
+    return {"name":"4",
+        "strokes":[[(cx-s,cy-int(0.3*s)),(cx-s,cy+int(0.3*s)),(cx+s,cy+int(0.3*s))],
+                   [(cx+int(0.5*s),cy-s),(cx+int(0.5*s),cy+s)]],
+        "start_points":[(cx-s,cy-int(0.3*s)),(cx+int(0.5*s),cy-s)]}
+
+def tpl_5(cx, cy, s):
+    lo=arc(cx,cy+int(0.3*s),int(0.7*s),int(0.7*s),math.pi,2*math.pi,30)
+    return {"name":"5",
+        "strokes":[[(cx+s,cy-s),(cx-s,cy-s),(cx-s,cy)],lo],
+        "start_points":[(cx+s,cy-s),(cx-s,cy-s),(cx-s,cy)]}
+
+def tpl_6(cx, cy, s):
+    p=arc(cx,cy+int(0.3*s),int(0.7*s),int(0.7*s),0,2*math.pi,60)
+    return {"name":"6",
+        "strokes":[[(cx+s,cy-s),(cx-int(0.5*s),cy-s)],
+                   arc(cx-int(0.3*s),cy,int(0.7*s),s,-math.pi/2,math.pi,40),p],
+        "start_points":[(cx+s,cy-s),(cx-int(0.5*s),cy-s)]}
+
+def tpl_7(cx, cy, s):
+    return {"name":"7",
+        "strokes":[[(cx-s,cy-s),(cx+s,cy-s),(cx-int(0.3*s),cy+s)]],
+        "start_points":[(cx-s,cy-s),(cx+s,cy-s)]}
+
+def tpl_8(cx, cy, s):
+    up=arc(cx,cy-int(0.5*s),int(0.6*s),int(0.5*s),0,2*math.pi,30)
+    lo=arc(cx,cy+int(0.5*s),int(0.6*s),int(0.5*s),0,2*math.pi,30)
+    return {"name":"8","strokes":[up,lo],
+            "start_points":[up[0],up[15],lo[0],lo[15]]}
+
+def tpl_9(cx, cy, s):
+    p=arc(cx,cy-int(0.3*s),int(0.7*s),int(0.7*s),0,2*math.pi,60)
+    return {"name":"9",
+        "strokes":[p,[(cx+int(0.7*s),cy-int(0.3*s)),(cx,cy+s)]],
+        "start_points":[p[0],p[15],(cx+int(0.7*s),cy-int(0.3*s))]}
+
+# ================== DANH SÁCH TOÀN BỘ TEMPLATE ==================
+ALL_TEMPLATES = [
+    # Hình học (10)
+    tpl_circle, tpl_ellipse, tpl_square, tpl_rectangle, tpl_triangle,
+    tpl_pentagon, tpl_hexagon, tpl_star, tpl_plus, tpl_cross,
+    # Chữ cái A-Z (26)
+    tpl_A, tpl_B, tpl_C, tpl_D, tpl_E, tpl_F, tpl_G, tpl_H, tpl_I, tpl_J,
+    tpl_K, tpl_L, tpl_M, tpl_N, tpl_O, tpl_P, tpl_Q, tpl_R, tpl_S, tpl_T,
+    tpl_U, tpl_V, tpl_W, tpl_X, tpl_Y, tpl_Z,
+    # Số 0-9 (10)
+    tpl_0, tpl_1, tpl_2, tpl_3, tpl_4, tpl_5, tpl_6, tpl_7, tpl_8, tpl_9
+]
+
+# ================== TEMPLATE CŨ (deprecated) ==================
+def template_Y(cx, cy, s=None):
+    if s is None:
+        s = TEMPLATE_SCALE
+    return {
+        "strokes": [
+            [(cx, cy), (cx - s, cy - s)],
+            [(cx, cy), (cx + s, cy - s)],
+            [(cx, cy), (cx, cy + s)],
+        ],
+        "start_points": [
+            (cx - s, cy - s),
+            (cx + s, cy - s),
+            (cx, cy + s),
+        ]
+    }
+
+def template_V(cx, cy, s=None):
+    if s is None:
+        s = TEMPLATE_SCALE
+    return {
+        "strokes": [
+            [(cx - s, cy - s), (cx, cy + s)],
+            [(cx, cy + s), (cx + s, cy - s)],
+        ],
+        "start_points": [
+            (cx - s, cy - s),
+            (cx + s, cy - s),
+            (cx, cy + s),
+        ]
+    }
+
+def template_L(cx, cy, s=None):
+    if s is None:
+        s = TEMPLATE_SCALE
+    return {
+        "strokes": [
+            [(cx, cy - s), (cx, cy + s)],
+            [(cx, cy + s), (cx + s, cy + s)],
+        ],
+        "start_points": [
+            (cx, cy - s),
+            (cx, cy + s),
+            (cx + s, cy + s),
+        ]
+    }
+
+def template_triangle(cx, cy, s=None):
+    if s is None:
+        s = TEMPLATE_SCALE
+    return {
+        "strokes": [
+            [(cx, cy - s), (cx - s, cy + s)],
+            [(cx - s, cy + s), (cx + s, cy + s)],
+            [(cx + s, cy + s), (cx, cy - s)],
+        ],
+        "start_points": [
+            (cx, cy - s),
+            (cx - s, cy + s),
+            (cx + s, cy + s),
+        ]
+    }
+
+def check_overlap(cx, cy, existing_positions, min_dist=400):
+    """Kiểm tra xem vị trí mới có chồng lên vị trí cũ không"""
+    for ex, ey in existing_positions:
+        dist = math.hypot(cx - ex, cy - ey)
+        if dist < min_dist:
+            return True
+    return False
+
+def generate_templates():
+    """Random 2-4 hình/chữ/số mẫu mỗi lần chạy, không chồng lên nhau"""
+    templates = []
+    positions = []  # lưu các vị trí đã dùng
+    
+    n = random.randint(2, 4)  # tăng số lượng mẫu
+    max_attempts = 50  # số lần thử tối đa cho mỗi hình
+    
+    for _ in range(n):
+        placed = False
+        attempts = 0
+        
+        while not placed and attempts < max_attempts:
+            cx = random.randint(350, WIDTH - 350)
+            cy = random.randint(300, HEIGHT - 300)
+            
+            # Kiểm tra không chồng lên hình đã có
+            if not check_overlap(cx, cy, positions):
+                fn = random.choice(ALL_TEMPLATES)
+                tpl = fn(cx, cy, TEMPLATE_SCALE)
+                
+                # 🔒 random điểm bắt đầu CHỈ 1 LẦN
+                tpl["start_point"] = random.choice(tpl["start_points"])
+                
+                templates.append(tpl)
+                positions.append((cx, cy))
+                placed = True
+            
+            attempts += 1
+        
+        # Nếu không tìm được vị trí sau max_attempts, bỏ qua hình này
+        if not placed:
+            print(f"⚠️ Không thể đặt hình thứ {len(templates) + 1} (hết chỗ)")
+    
+    return templates
+
+# ================== TẠO BÀI MẪU ==================
+templates = generate_templates()
+print(f"🎯 Đã tạo {len(templates)} hình/chữ mẫu để tập vẽ")
+
+# ================== TRẠNG THÁI CON TRỎ ==================
+x = float(WIDTH // 2)
+y = float(HEIGHT // 2)
+
+# VẬN TỐC (cho acceleration smoothing)
+vx = 0.0
+vy = 0.0
+
+# strokes = [ [(x1,y1),(x2,y2),...],  [(...), ...], ... ]
+strokes: list[list[tuple[int, int]]] = []
+current_stroke: list[tuple[int, int]] | None = None
+
+# Undo/Redo history
+undo_history: list[list[tuple[int, int]]] = []  # lưu các stroke đã xóa
+prev_undo = 0  # để bắt cạnh nhấn (rising edge) của nút 5
+prev_redo = 0  # để bắt cạnh nhấn (rising edge) của nút 7
+
+# ================== LOOP CHÍNH ==================
+running = True
+while running:
+    clock.tick(FPS)
+    pygame.event.pump()
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+    # ===== ĐỌC NÚT =====
+    draw_held = (js.get_button(DRAW_BTN) == 1)
+    undo_now = (js.get_button(UNDO_BTN) == 1)
+    redo_now = (js.get_button(REDO_BTN) == 1)
+
+    # UNDO: chỉ khi nhấn 1 lần (bắt cạnh)
+    if undo_now and not prev_undo:
+        # Nếu đang vẽ mà muốn "xóa nét vừa vẽ trước đó" ngay lúc này:
+        # ưu tiên xóa current_stroke nếu có điểm, còn không thì xóa stroke cuối đã lưu
+        if current_stroke is not None and len(current_stroke) > 0:
+            undo_history.append(current_stroke)
+            current_stroke = None
+        elif strokes:
+            removed = strokes.pop()
+            undo_history.append(removed)
+
+    prev_undo = 1 if undo_now else 0
+
+    # REDO: chỉ khi nhấn 1 lần (bắt cạnh)
+    if redo_now and not prev_redo:
+        if undo_history:
+            restored = undo_history.pop()
+            strokes.append(restored)
+
+    prev_redo = 1 if redo_now else 0
+
+    # ===== ĐỌC CẦN PHẢI =====
+    rx = apply_deadzone(js.get_axis(AXIS_RX) if AXIS_RX < js.get_numaxes() else 0.0)
+    ry = apply_deadzone(js.get_axis(AXIS_RY) if AXIS_RY < js.get_numaxes() else 0.0)
+
+    if INVERT_X:
+        rx = -rx
+    if INVERT_Y:
+        ry = -ry
+
+    rx, ry = normalize_if_needed(rx, ry)
+
+    # ===== TÍNH DELTA TIME =====
+    dt = clock.get_time() / 1000.0
+    if dt <= 0:
+        dt = 1.0 / FPS
+
+    # ===== CHỌN TỐC ĐỘ THEO TRẠNG THÁI =====
+    base_speed = SPEED_DRAW if draw_held else SPEED_IDLE
+
+    # ===== DIAGONAL SENSITIVITY BOOST (không vọt tốc) =====
+    diag_strength = min(abs(rx), abs(ry))          # chỉ >0 khi đi xéo
+    diag_gain = 1.0 + DIAG_SENS_GAIN * diag_strength
+
+    # ===== VẬN TỐC MỤC TIÊU (px/s) =====
+    # base_speed đang là px/frame @60fps, đổi sang px/s:
+    speed_px_s = base_speed * FPS * SENSITIVITY * diag_gain
+
+    target_vx = rx * speed_px_s
+    target_vy = ry * speed_px_s
+
+    # ===== ACCEL LIMIT (ramp) =====
+    accel = ACCEL_PX_S2_DRAW if draw_held else ACCEL_PX_S2_IDLE
+    max_dv = accel * dt
+
+    def approach(v, target, max_delta):
+        if target > v:
+            return min(target, v + max_delta)
+        else:
+            return max(target, v - max_delta)
+
+    vx = approach(vx, target_vx, max_dv)
+    vy = approach(vy, target_vy, max_dv)
+
+    # ===== CẬP NHẬT VỊ TRÍ (FLOAT) =====
+    x += vx * dt
+    y += vy * dt
+
+    x = max(0.0, min(float(WIDTH), x))
+    y = max(0.0, min(float(HEIGHT), y))
+
+    # ===== LOGIC VẼ (giống Paint) =====
+    if draw_held:
+        if current_stroke is None:
+            current_stroke = []
+            add_point_to_stroke(current_stroke, int(x), int(y))  # chỉ ép int khi vẽ
+            # Xóa redo history khi bắt đầu vẽ stroke mới (giống Paint)
+            undo_history.clear()
+        else:
+            add_point_to_stroke(current_stroke, int(x), int(y))  # chỉ ép int khi vẽ
+    else:
+        # thả nút 4 → chốt stroke vào danh sách (nếu đủ điểm)
+        if current_stroke is not None:
+            if len(current_stroke) >= 2:
+                strokes.append(current_stroke)
+            current_stroke = None
+
+    # ===== VẼ FRAME =====
+    screen.fill((255, 255, 255))
+    draw_grid(screen)
+
+    # ===== VẼ TEMPLATE (BÀI MẪU) =====
+    for t in templates:
+        # Vẽ các nét mẫu xám
+        for stroke in t["strokes"]:
+            pygame.draw.lines(
+                screen,
+                TEMPLATE_COLOR,
+                False,
+                stroke,
+                TEMPLATE_WIDTH
+            )
+        
+        # Vẽ điểm bắt đầu xanh lá (cố định)
+        pygame.draw.circle(
+            screen,
+            START_COLOR,
+            t["start_point"],
+            START_RADIUS
+        )
+
+    # vẽ các stroke đã chốt
+    for stroke in strokes:
+        if len(stroke) >= 2:
+            pygame.draw.lines(screen, LINE_COLOR, False, stroke, LINE_WIDTH)
+
+    # vẽ stroke đang vẽ (nếu đang giữ nút 4)
+    if current_stroke is not None and len(current_stroke) >= 2:
+        pygame.draw.lines(screen, LINE_COLOR, False, current_stroke, LINE_WIDTH)
+
+    # vẽ con trỏ đỏ (chỉ ép int khi vẽ)
+    pygame.draw.circle(screen, CURSOR_COLOR, (int(x), int(y)), CURSOR_RADIUS)
+
+    pygame.display.flip()
+
+pygame.quit()
+sys.exit()
