@@ -1,0 +1,271 @@
+# ✅ Controller Debug Implementation - CHECKLIST
+
+**Date:** 2025-12-25  
+**Implementation:** Option B - Controller(GT) & Controller(Pred) với CSV logging  
+**Status:** ✅ COMPLETE
+
+---
+
+## 📋 Implementation Checklist
+
+### ✅ 1. CSV Logger (run_logger.py)
+- [x] File created: `visualization/run_logger.py`
+- [x] Class `RunCSVLogger` với auto timestamp
+- [x] Lazy header writing (first row defines columns)
+- [x] NaN handling (convert to empty string)
+- [x] Nested dict flattening support
+- [x] Auto-flush after each row
+
+**Output:**
+- CSV saved to: `{report_save_root}/run_<timestamp>.csv`
+- Default: `Test_Model/reports/run_YYYYMMDD_HHMMSS.csv`
+
+---
+
+### ✅ 2. Speed Sign Mapping (mapping_utils.py)
+- [x] `speed_sign_value_to_class()`: GT value (-1/30/60/90) → class id (0..3)
+- [x] `speed_sign_class_to_value()`: class id (0..3) → GT value (-1/30/60/90)
+- [x] Alias functions rõ ràng cho controller input
+
+**Verified:**
+```python
+speed_sign_value_to_class(30) == 1  # ✅
+speed_sign_class_to_value(1) == 30  # ✅
+```
+
+---
+
+### ✅ 3. Controller Input Standardization (app.py)
+
+#### A. `aff_to_controller_input()` function
+- [x] Regression: float (physical units, already denormalized)
+- [x] red_light/hazard_stop: int class id (0/1)
+- [x] **speed_sign: int class id (0..3)** ⭐ QUAN TRỌNG
+- [x] `is_gt=True`: GT speed_sign (-1/30/60/90) → convert to class id
+- [x] `is_gt=False`: Pred logits → class id
+- [x] Safe defaults (no NaN):
+  - veh_distance: default 50.0
+  - speed: default 0.0
+  - others: default 0.0
+
+#### B. `pred_conv_dict()` function
+- [x] Regression conv: denormalized + clamped values
+- [x] Classification conv:
+  - red_light/hazard_stop: keep as class id
+  - **speed_sign: class id → GT value (-1/30/60/90)** for CSV evaluation
+
+#### C. `_call_controller()` update
+- [x] **NEVER returns None**
+- [x] Returns `{"error": "..."}` if controller unavailable
+- [x] Returns `{"error": "..."}` if signature mismatch
+
+---
+
+### ✅ 4. Option B Controller (app.py)
+
+#### In `update_video_frame()` - REALTIME mode:
+
+**Before (OLD):**
+```python
+ctrl_gt = _call_controller(gt, current_speed, direction_int) if gt else None
+ctrl_aff = ctrl_aff_from(pred_denorm, pred)
+ctrl_pred = _call_controller(ctrl_aff, current_speed, direction_int)
+```
+
+**After (NEW - Option B):**
+```python
+# Controller (Option B): chuẩn hoá affordances
+ctrl_gt = None
+ctrl_pred = None
+
+if gt:
+    gt_ctrl_in = aff_to_controller_input(gt, is_gt=True)
+    ctrl_gt = _call_controller(gt_ctrl_in, current_speed, direction_int)
+
+pred_ctrl_in = aff_to_controller_input(ctrl_aff_from(pred_denorm, pred), is_gt=False)
+ctrl_pred = _call_controller(pred_ctrl_in, current_speed, direction_int)
+```
+
+**Key Changes:**
+- ✅ GT speed_sign (-1/30/60/90) → class id (0..3) before controller
+- ✅ Pred speed_sign logits → class id (0..3) before controller
+- ✅ All regression values: physical units (denormalized)
+- ✅ No None/NaN → returns dict with 'error' key if fails
+
+---
+
+### ✅ 5. CSV Logging (app.py)
+
+#### Columns logged:
+
+**Metadata:**
+- `mode`: "VIDEO_REALTIME" or "VIDEO_PRECOMPUTE"
+- `episode`: episode name (e.g., "set1_episode_033")
+- `frame_idx`: current frame index
+- `image_rel`: GT key used for lookup
+- `direction_ui`: UI command (2/3/4/5)
+- `direction_model`: model direction (-1/0/1)
+
+**GT Affordances:**
+- `gt_relative_angle`, `gt_center_distance`, `gt_veh_distance`, `gt_speed`
+- `gt_red_light`, `gt_hazard_stop`, `gt_speed_sign`
+
+**Pred Raw (normalized/logits):**
+- `pred_raw_relative_angle`, `pred_raw_center_distance`, `pred_raw_veh_distance`, `pred_raw_speed`
+- `pred_raw_red_light` (class id), `pred_raw_hazard_stop` (class id), `pred_raw_speed_sign` (class id)
+
+**Pred Conv (physical/GT-domain):**
+- `pred_conv_relative_angle`, `pred_conv_center_distance`, `pred_conv_veh_distance`, `pred_conv_speed`
+- `pred_conv_red_light` (class id), `pred_conv_hazard_stop` (class id), **`pred_conv_speed_sign` (GT value: -1/30/60/90)** ⭐
+
+**Controller Outputs:**
+- `ctrl_gt_steer`, `ctrl_gt_throttle`, `ctrl_gt_brake`, `ctrl_gt_error`
+- `ctrl_pred_steer`, `ctrl_pred_throttle`, `ctrl_pred_brake`, `ctrl_pred_error`
+
+---
+
+## 🧪 Verification Steps
+
+### 1. Controller Load Check
+```bash
+# Start app, check console output
+[CTRL] config path = ...
+[CTRL] Loaded OK  # ✅ Should see this
+[CSV] Logging to: Test_Model/reports/run_YYYYMMDD_HHMMSS.csv
+```
+
+### 2. Controller Not None Check
+```python
+# In UI, check Controller table columns:
+# Should NEVER show "N/A" for both GT and Pred
+# If controller failed: should show "error=..." in cells
+```
+
+### 3. Speed Sign Mapping Check
+```python
+# Example GT speed_sign = 30
+# -> gt_ctrl_in['speed_sign'] should be 1 (class id)
+# -> pred_conv['speed_sign'] should be 30 (GT value for CSV)
+
+# Test in Python:
+from mapping_utils import speed_sign_value_to_class, speed_sign_class_to_value
+assert speed_sign_value_to_class(30) == 1
+assert speed_sign_class_to_value(1) == 30
+```
+
+### 4. CSV Output Check
+```bash
+# Run app, play a few frames in VIDEO mode
+# CSV should be created automatically
+ls -lh Test_Model/reports/run_*.csv
+
+# Check columns
+head -1 Test_Model/reports/run_*.csv | tr ',' '\n' | grep -E "ctrl_|speed_sign"
+# Should see:
+# - gt_speed_sign (GT value: -1/30/60/90)
+# - pred_raw_speed_sign (class id: 0/1/2/3)
+# - pred_conv_speed_sign (GT value: -1/30/60/90)
+# - ctrl_gt_steer, ctrl_gt_throttle, ctrl_gt_brake, ctrl_gt_error
+# - ctrl_pred_steer, ctrl_pred_throttle, ctrl_pred_brake, ctrl_pred_error
+```
+
+### 5. No NaN Check
+```bash
+# Check CSV for NaN/None values in controller columns
+grep -E "ctrl_gt_error|ctrl_pred_error" Test_Model/reports/run_*.csv
+
+# If controller unavailable: should see error message, NOT empty/NaN
+# If controller OK: should see numeric values or empty (not "NaN")
+```
+
+---
+
+## 🎯 Expected Behavior
+
+### Scenario 1: Controller Loaded Successfully
+```
+UI Table:
+┌─────────────┬────────────┬─────────────┐
+│ Key         │ Ctrl(GT)   │ Ctrl(Pred)  │
+├─────────────┼────────────┼─────────────┤
+│ steer       │ 0.0245     │ 0.0189      │
+│ throttle    │ 0.5600     │ 0.5200      │
+│ brake       │ 0.0000     │ 0.0000      │
+│ error       │            │             │
+└─────────────┴────────────┴─────────────┘
+
+CSV:
+ctrl_gt_steer,ctrl_gt_throttle,ctrl_gt_brake,ctrl_gt_error,ctrl_pred_steer,...
+0.0245,0.5600,0.0000,,0.0189,...
+```
+
+### Scenario 2: Controller Not Available
+```
+UI Table:
+┌─────────────┬────────────────────────────────────────┬────────────────────────────────────────┐
+│ Key         │ Ctrl(GT)                               │ Ctrl(Pred)                             │
+├─────────────┼────────────────────────────────────────┼────────────────────────────────────────┤
+│ error       │ Controller not available: config not found │ Controller not available: config not found │
+└─────────────┴────────────────────────────────────────┴────────────────────────────────────────┘
+
+CSV:
+ctrl_gt_error,ctrl_pred_error
+"Controller not available: config not found","Controller not available: config not found"
+```
+
+### Scenario 3: Speed Sign Conversion
+```
+GT: speed_sign = 30 (from CSV)
+→ gt_ctrl_in['speed_sign'] = 1 (class id for controller)
+→ pred_conv['speed_sign'] = 30 (GT value for CSV evaluation)
+
+CSV:
+gt_speed_sign,pred_raw_speed_sign,pred_conv_speed_sign
+30,1,30
+```
+
+---
+
+## 📊 Debug Tips
+
+### If Controller shows N/A:
+1. Check console: `[CTRL] Loaded OK` should appear
+2. Check `_call_controller()` returns dict (not None)
+3. Check `build_ctrl_table()` handles dict correctly
+
+### If Controller shows error:
+1. Check controller config file exists
+2. Check controller signature matches
+3. Check affordances have correct types (float for regression, int for classification)
+
+### If Speed Sign wrong in CSV:
+1. Check GT: should be -1/30/60/90 (not class id)
+2. Check pred_raw: should be class id 0/1/2/3
+3. Check pred_conv: should be -1/30/60/90 (GT value)
+
+### If veh_distance causes controller to crash:
+1. Check denormalization: should be 0-50m range
+2. Check default: missing veh_distance defaults to 50.0
+3. Check clamping: values >50 should clamp to 50.0
+
+---
+
+## 🚀 Next Steps (Optional)
+
+### For PRECOMPUTE mode:
+Similar implementation needed in `episode_processor.py`:
+1. Update cached data to include `ctrl_gt` and `ctrl_pred` (Option B)
+2. Log CSV during episode processing (all frames at once)
+3. Ensure speed_sign mapping consistent
+
+### For better debugging:
+1. Add `debug_csv` mode to log intermediate values
+2. Add validation warnings if affordances out of range
+3. Add controller timing metrics
+
+---
+
+**Implementation Status:** ✅ COMPLETE & READY TO TEST
+**Files Modified:** 3 files (run_logger.py NEW, mapping_utils.py, app.py)
+**Lines Changed:** ~200 lines added
+**Breaking Changes:** None (backward compatible)
